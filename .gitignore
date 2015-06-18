@@ -32,3 +32,4 @@ test_vec
 
 # emacs directory setting:
 .dir-locals.el
+build
