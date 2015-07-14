@@ -42,6 +42,7 @@
 #include <opm/core/utility/Units.hpp>
 #include <opm/core/well_controls.h>
 #include <opm/core/utility/parameters/ParameterGroup.hpp>
+#include <opm/parser/eclipse/EclipseState/EclipseState.hpp>
 
 #include <cassert>
 #include <cmath>
@@ -144,6 +145,7 @@ namespace detail {
                   const RockCompressibility*      rock_comp_props,
                   const Wells*                    wells,
                   const NewtonIterationBlackoilInterface&    linsolver,
+                  Opm::EclipseStateConstPtr eclState,
                   const bool has_disgas,
                   const bool has_vapoil,
                   const bool terminal_output)
@@ -156,7 +158,7 @@ namespace detail {
         , active_(detail::activePhases(fluid.phaseUsage()))
         , canph_ (detail::active2Canonical(fluid.phaseUsage()))
         , cells_ (detail::buildAllCells(Opm::AutoDiffGrid::numCells(grid)))
-        , ops_   (grid)
+        , ops_   (grid, eclState)
         , wops_  (wells_)
         , has_disgas_(has_disgas)
         , has_vapoil_(has_vapoil)
@@ -628,7 +630,7 @@ namespace detail {
         for (int phase = 0; phase < maxnp; ++phase) {
             if (active_[ phase ]) {
                 const int pos = pu.phase_pos[ phase ];
-                rq_[pos].b = fluidReciprocFVF(phase, state.canonical_phase_pressures[phase], temp, rs, rv, cond, cells_);
+                rq_[pos].b = fluidReciprocFVF(phase, state.canonical_phase_pressures[phase], temp, rs, rv, cond);
                 rq_[pos].accum[aix] = pv_mult * rq_[pos].b * sat[pos];
                 // OPM_AD_DUMP(rq_[pos].b);
                 // OPM_AD_DUMP(rq_[pos].accum[aix]);
@@ -810,8 +812,10 @@ namespace detail {
             solveWellEq(mob_perfcells, b_perfcells, state, well_state);
         }
 
-        asImpl().addWellEq(state, well_state, mob_perfcells, b_perfcells, aliveWells, cq_s);
-        asImpl().addWellContributionToMassBalanceEq(state, well_state, cq_s);
+        asImpl().computeWellFlux(state, mob_perfcells, b_perfcells, aliveWells, cq_s);
+        asImpl().updatePerfPhaseRatesAndPressures(cq_s, state, well_state);
+        asImpl().addWellFluxEq(cq_s, state);
+        asImpl().addWellContributionToMassBalanceEq(cq_s, state, well_state);
         addWellControlEq(state, well_state, aliveWells);        
     }
 
@@ -835,9 +839,13 @@ namespace detail {
         // Set up the common parts of the mass balance equations
         // for each active phase.
         const V transi = subset(geo_.transmissibility(), ops_.internal_faces);
+        const V trans_nnc = ops_.nnc_trans;
+        V trans_all(transi.size() + trans_nnc.size());
+        trans_all << transi, trans_nnc;
+
         const std::vector<ADB> kr = computeRelPerm(state);
         for (int phaseIdx = 0; phaseIdx < fluid_.numPhases(); ++phaseIdx) {
-            asImpl().computeMassFlux(phaseIdx, transi, kr[canph_[phaseIdx]], state.canonical_phase_pressures[canph_[phaseIdx]], state);
+            asImpl().computeMassFlux(phaseIdx, trans_all, kr[canph_[phaseIdx]], state.canonical_phase_pressures[canph_[phaseIdx]], state);
 
             residual_.material_balance_eq[ phaseIdx ] =
                 pvdt_ * (rq_[phaseIdx].accum[1] - rq_[phaseIdx].accum[0])
@@ -875,9 +883,9 @@ namespace detail {
 
     template <class Grid, class Implementation>
     void
-    BlackoilModelBase<Grid, Implementation>::addWellContributionToMassBalanceEq(const SolutionState&,
-                                                                                const WellState&,
-                                                                                const std::vector<ADB>& cq_s)
+    BlackoilModelBase<Grid, Implementation>::addWellContributionToMassBalanceEq(const std::vector<ADB>& cq_s,
+                                                                                const SolutionState&,
+                                                                                const WellState&)
     {
         // Add well contributions to mass balance equations
         const int nc = Opm::AutoDiffGrid::numCells(grid_);
@@ -896,12 +904,11 @@ namespace detail {
 
     template <class Grid, class Implementation>
     void
-    BlackoilModelBase<Grid, Implementation>::addWellEq(const SolutionState& state,
-                                                       WellState& xw,
-                                                       const std::vector<ADB>& mob_perfcells,
-                                                       const std::vector<ADB>& b_perfcells,
-                                                       V& aliveWells,
-                                                       std::vector<ADB>& cq_s)
+    BlackoilModelBase<Grid, Implementation>::computeWellFlux(const SolutionState& state,
+                                                             const std::vector<ADB>& mob_perfcells,
+                                                             const std::vector<ADB>& b_perfcells,
+                                                             V& aliveWells,
+                                                             std::vector<ADB>& cq_s)
     {
         if( ! wellsActive() ) return ;
 
@@ -921,8 +928,6 @@ namespace detail {
 
         // Perforation pressure
         const ADB perfpressure = (wops_.w2p * state.bhp) + cdp;
-        std::vector<double> perfpressure_d(perfpressure.value().data(), perfpressure.value().data() + nperf);
-        xw.perfPress() = perfpressure_d;
 
         // Pressure drawdown (also used to determine direction of flow)
         const ADB drawdown =  p_perfcells - perfpressure;
@@ -1015,13 +1020,6 @@ namespace detail {
             cq_s[phase] = cq_ps[phase] + cmix_s[phase]*cqt_is;
         }
 
-        // WELL EQUATIONS
-        ADB qs = state.qs;
-        for (int phase = 0; phase < np; ++phase) {
-            qs -= superset(wops_.p2w * cq_s[phase], Span(nw, 1, phase*nw), nw*np);
-
-        }
-
         // check for dead wells (used in the well controll equations)
         aliveWells = V::Constant(nw, 1.0);
         for (int w = 0; w < nw; ++w) {
@@ -1029,15 +1027,48 @@ namespace detail {
                 aliveWells[w] = 0.0;
             }
         }
+    }
 
-        // Update the perforation phase rates (used to calculate the pressure drop in the wellbore)
+
+
+
+
+    template <class Grid, class Implementation>
+    void BlackoilModelBase<Grid, Implementation>::updatePerfPhaseRatesAndPressures(const std::vector<ADB>& cq_s,
+                                                                                   const SolutionState& state,
+                                                                                   WellState& xw)
+    {
+        // Update the perforation phase rates (used to calculate the pressure drop in the wellbore).
+        const int np = wells().number_of_phases;
+        const int nw = wells().number_of_wells;
+        const int nperf = wells().well_connpos[nw];
         V cq = superset(cq_s[0].value(), Span(nperf, np, 0), nperf*np);
         for (int phase = 1; phase < np; ++phase) {
             cq += superset(cq_s[phase].value(), Span(nperf, np, phase), nperf*np);
         }
+        xw.perfPhaseRates().assign(cq.data(), cq.data() + nperf*np);
 
-        std::vector<double> cq_d(cq.data(), cq.data() + nperf*np);
-        xw.perfPhaseRates() = cq_d;
+        // Update the perforation pressures.
+        const V& cdp = well_perforation_pressure_diffs_;
+        const V perfpressure = (wops_.w2p * state.bhp.value().matrix()).array() + cdp;
+        xw.perfPress().assign(perfpressure.data(), perfpressure.data() + nperf);
+    }
+
+
+
+
+
+    template <class Grid, class Implementation>
+    void BlackoilModelBase<Grid, Implementation>::addWellFluxEq(const std::vector<ADB>& cq_s,
+                                                                const SolutionState& state)
+    {
+        const int np = wells().number_of_phases;
+        const int nw = wells().number_of_wells;
+        ADB qs = state.qs;
+        for (int phase = 0; phase < np; ++phase) {
+            qs -= superset(wops_.p2w * cq_s[phase], Span(nw, 1, phase*nw), nw*np);
+
+        }
 
         residual_.well_flux_eq = qs;
     }
@@ -1232,7 +1263,9 @@ namespace detail {
 
             SolutionState wellSolutionState = state0;
             variableStateExtractWellsVars(indices, vars, wellSolutionState);
-            asImpl().addWellEq(wellSolutionState, well_state, mob_perfcells_const, b_perfcells_const, aliveWells, cq_s);
+            asImpl().computeWellFlux(wellSolutionState, mob_perfcells_const, b_perfcells_const, aliveWells, cq_s);
+            asImpl().updatePerfPhaseRatesAndPressures(cq_s, wellSolutionState, well_state);
+            asImpl().addWellFluxEq(cq_s, wellSolutionState);
             addWellControlEq(wellSolutionState, well_state, aliveWells);
             converged = getWellConvergence(it);
 
@@ -1788,11 +1821,11 @@ namespace detail {
         const int canonicalPhaseIdx = canph_[ actph ];
         const std::vector<PhasePresence>& cond = phaseCondition();
         const ADB tr_mult = transMult(state.pressure);
-        const ADB mu = fluidViscosity(canonicalPhaseIdx, phasePressure, state.temperature, state.rs, state.rv, cond, cells_);
+        const ADB mu = fluidViscosity(canonicalPhaseIdx, phasePressure, state.temperature, state.rs, state.rv, cond);
         rq_[ actph ].mob = tr_mult * kr / mu;
 
         // Compute head differentials. Gravity potential is done using the face average as in eclipse and MRST.
-        const ADB rho = fluidDensity(canonicalPhaseIdx, phasePressure, state.temperature, state.rs, state.rv, cond, cells_);
+        const ADB rho = fluidDensity(canonicalPhaseIdx, rq_[actph].b, state.rs, state.rv);
         const ADB rhoavg = ops_.caver * rho;
         rq_[ actph ].dh = ops_.ngrad * phasePressure - geo_.gravity()[2] * (rhoavg * (ops_.ngrad * geo_.z().matrix()));
         if (use_threshold_pressure_) {
@@ -2157,21 +2190,19 @@ namespace detail {
     template <class Grid, class Implementation>
     ADB
     BlackoilModelBase<Grid, Implementation>::fluidViscosity(const int               phase,
-                                                   const ADB&              p    ,
-                                                   const ADB&              temp ,
-                                                const ADB&              rs   ,
-                                                const ADB&              rv   ,
-                                                const std::vector<PhasePresence>& cond,
-                                                const std::vector<int>& cells) const
+                                                            const ADB&              p    ,
+                                                            const ADB&              temp ,
+                                                            const ADB&              rs   ,
+                                                            const ADB&              rv   ,
+                                                            const std::vector<PhasePresence>& cond) const
     {
         switch (phase) {
         case Water:
-            return fluid_.muWat(p, temp, cells);
-        case Oil: {
-            return fluid_.muOil(p, temp, rs, cond, cells);
-        }
+            return fluid_.muWat(p, temp, cells_);
+        case Oil:
+            return fluid_.muOil(p, temp, rs, cond, cells_);
         case Gas:
-            return fluid_.muGas(p, temp, rv, cond, cells);
+            return fluid_.muGas(p, temp, rv, cond, cells_);
         default:
             OPM_THROW(std::runtime_error, "Unknown phase index " << phase);
         }
@@ -2184,21 +2215,19 @@ namespace detail {
     template <class Grid, class Implementation>
     ADB
     BlackoilModelBase<Grid, Implementation>::fluidReciprocFVF(const int               phase,
-                                                  const ADB&              p    ,
-                                                  const ADB&              temp ,
-                                                  const ADB&              rs   ,
-                                                  const ADB&              rv   ,
-                                                  const std::vector<PhasePresence>& cond,
-                                                  const std::vector<int>& cells) const
+                                                              const ADB&              p    ,
+                                                              const ADB&              temp ,
+                                                              const ADB&              rs   ,
+                                                              const ADB&              rv   ,
+                                                              const std::vector<PhasePresence>& cond) const
     {
         switch (phase) {
         case Water:
-            return fluid_.bWat(p, temp, cells);
-        case Oil: {
-            return fluid_.bOil(p, temp, rs, cond, cells);
-        }
+            return fluid_.bWat(p, temp, cells_);
+        case Oil:
+            return fluid_.bOil(p, temp, rs, cond, cells_);
         case Gas:
-            return fluid_.bGas(p, temp, rv, cond, cells);
+            return fluid_.bGas(p, temp, rv, cond, cells_);
         default:
             OPM_THROW(std::runtime_error, "Unknown phase index " << phase);
         }
@@ -2210,24 +2239,20 @@ namespace detail {
 
     template <class Grid, class Implementation>
     ADB
-    BlackoilModelBase<Grid, Implementation>::fluidDensity(const int               phase,
-                                                 const ADB&              p    ,
-                                                 const ADB&              temp ,
-                                              const ADB&              rs   ,
-                                              const ADB&              rv   ,
-                                              const std::vector<PhasePresence>& cond,
-                                              const std::vector<int>& cells) const
+    BlackoilModelBase<Grid, Implementation>::fluidDensity(const int  phase,
+                                                          const ADB& b,
+                                                          const ADB& rs,
+                                                          const ADB& rv) const
     {
         const double* rhos = fluid_.surfaceDensity();
-        ADB b = fluidReciprocFVF(phase, p, temp, rs, rv, cond, cells);
-        ADB rho = V::Constant(p.size(), 1, rhos[phase]) * b;
+        ADB rho = rhos[phase] * b;
         if (phase == Oil && active_[Gas]) {
             // It is correct to index into rhos with canonical phase indices.
-            rho += V::Constant(p.size(), 1, rhos[Gas]) * rs * b;
+            rho += rhos[Gas] * rs * b;
         }
         if (phase == Gas && active_[Oil]) {
             // It is correct to index into rhos with canonical phase indices.
-            rho += V::Constant(p.size(), 1, rhos[Oil]) * rv * b;
+            rho += rhos[Oil] * rv * b;
         }
         return rho;
     }
